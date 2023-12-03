@@ -31,15 +31,20 @@
 #include "rendering_device_vulkan.h"
 
 #include "core/config/project_settings.h"
+#include "core/error/error_macros.h"
 #include "core/io/compression.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/io/marshalls.h"
+#include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
+#include "core/string/print_string.h"
 #include "core/templates/hashfuncs.h"
 #include "drivers/vulkan/vulkan_context.h"
 
 #include "thirdparty/misc/smolv.h"
+#include "vulkan/vulkan_core.h"
+#include <algorithm>
 
 //#define FORCE_FULL_BARRIER
 
@@ -6527,9 +6532,18 @@ RID RenderingDeviceVulkan::render_pipeline_create(RID p_shader, FramebufferForma
 	graphics_pipeline_create_info.basePipelineIndex = 0;
 
 	RenderPipeline pipeline;
-	VkResult err = vkCreateGraphicsPipelines(device, pipelines_cache.cache_object, 1, &graphics_pipeline_create_info, nullptr, &pipeline.pipeline);
-	ERR_FAIL_COND_V_MSG(err, RID(), "vkCreateGraphicsPipelines failed with error " + itos(err) + " for shader '" + shader->name + "'.");
+	//VkResult err = vkCreateGraphicsPipelines(device, pipelines_cache.cache_object, 1, &graphics_pipeline_create_info, nullptr, &pipeline.pipeline);
+	//ERR_FAIL_COND_V_MSG(err, RID(), "vkCreateGraphicsPipelines failed with error " + itos(err) + " for shader '" + shader->name + "'.");
+	bool still_compiling = render_pipeline_compile_task != WorkerThreadPool::INVALID_TASK_ID && !WorkerThreadPool::get_singleton()->is_task_completed(render_pipeline_compile_task);
+	if (still_compiling) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(render_pipeline_compile_task);
+		render_pipeline_compile_task = WorkerThreadPool::INVALID_TASK_ID;
+	}
 
+	data.device = &device;
+	data.pipeline = &pipeline;
+	data.info = graphics_pipeline_create_info;
+	render_pipeline_compile_task = WorkerThreadPool::get_singleton()->add_native_task(_compile_render_pipeline, &data);
 	if (pipelines_cache.cache_object != VK_NULL_HANDLE) {
 		_update_pipeline_cache();
 	}
@@ -7270,6 +7284,11 @@ void RenderingDeviceVulkan::draw_list_bind_render_pipeline(DrawListID p_list, RI
 	dl->state.pipeline = p_render_pipeline;
 	dl->state.pipeline_layout = pipeline->pipeline_layout;
 
+	if (pipeline->pipeline != VK_NULL_HANDLE) {
+		print_verbose("pipeline not yet ready");
+		return;
+	}
+
 	vkCmdBindPipeline(dl->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
 
 	if (dl->state.pipeline_shader != pipeline->shader) {
@@ -7457,8 +7476,9 @@ void RenderingDeviceVulkan::draw_list_draw(DrawListID p_list, bool p_use_indices
 #endif
 
 #ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_MSG(!dl->validation.pipeline_active,
-			"No render pipeline was set before attempting to draw.");
+	if (!dl->validation.pipeline_active) {
+		return;
+	}
 	if (dl->validation.pipeline_vertex_format != INVALID_ID) {
 		// Pipeline uses vertices, validate format.
 		ERR_FAIL_COND_MSG(dl->validation.vertex_format == INVALID_ID,
@@ -8614,7 +8634,7 @@ void RenderingDeviceVulkan::set_resource_name(RID p_id, const String p_name) {
 		context->set_object_name(VK_OBJECT_TYPE_DESCRIPTOR_SET, uint64_t(uniform_set->descriptor_set), p_name);
 	} else if (render_pipeline_owner.owns(p_id)) {
 		RenderPipeline *pipeline = render_pipeline_owner.get_or_null(p_id);
-		context->set_object_name(VK_OBJECT_TYPE_PIPELINE, uint64_t(pipeline->pipeline), p_name);
+		//context->set_object_name(VK_OBJECT_TYPE_PIPELINE, uint64_t(pipeline->pipeline), p_name);
 		context->set_object_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT, uint64_t(pipeline->pipeline_layout), p_name + " Layout");
 	} else if (compute_pipeline_owner.owns(p_id)) {
 		ComputePipeline *pipeline = compute_pipeline_owner.get_or_null(p_id);
@@ -9272,6 +9292,13 @@ void RenderingDeviceVulkan::_save_pipeline_cache(void *p_data) {
 		f->store_buffer((const uint8_t *)&self->pipelines_cache.header, sizeof(PipelineCacheHeader));
 		f->store_buffer(self->pipelines_cache.buffer.ptr(), self->pipelines_cache.current_size);
 	}
+}
+
+void RenderingDeviceVulkan::_compile_render_pipeline(void *p_data){
+	RenderPipelineCompileData *data = static_cast<RenderPipelineCompileData *>(p_data);
+	ERR_FAIL_COND_EDMSG(!data, "invalid render pipeline compile data");
+
+	vkCreateGraphicsPipelines(*data->device, nullptr, 1, &data->info, nullptr, &data->pipeline->pipeline);
 }
 
 template <class T>

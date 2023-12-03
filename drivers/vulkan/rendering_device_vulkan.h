@@ -793,6 +793,16 @@ class RenderingDeviceVulkan : public RenderingDevice {
 
 	RID_Owner<RenderPipeline, true> render_pipeline_owner;
 
+	WorkerThreadPool::TaskID render_pipeline_compile_task = WorkerThreadPool::INVALID_TASK_ID;
+
+	struct RenderPipelineCompileData {
+		VkDevice *device;
+		RenderPipeline *pipeline;
+		VkGraphicsPipelineCreateInfo info;
+	};
+	RenderPipelineCompileData data = {};
+	static void _compile_render_pipeline(void *p_data);
+
 	struct PipelineCacheHeader {
 		uint32_t magic;
 		uint32_t data_size;
